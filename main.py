@@ -50,21 +50,24 @@ class OpenVikingMemoryPlugin(Star):
         return self.config.get("commit_threshold", 2000)
 
     def _get_headers(self, event: AstrMessageEvent) -> Dict[str, str]:
-        """Construct routing headers dynamically based on platform and context."""
+        """Construct routing headers with a unified, platform-safe naming convention."""
         platform = event.get_platform_name()
         group_id = event.get_group_id() 
         user_id = event.get_sender_id()
         
-        # Shared memory for Group/Server
+        # Consistent Account ID per platform
+        account_id = f"astrbot_{platform}"
+        
+        # User ID is always platform-scoped user
+        ov_user_id = f"{platform}_{user_id}"
+        
+        # Agent ID determines the memory scope (Shared for groups, Private for users)
         if group_id:
-            account_id = f"{platform}_{group_id}"
-            ov_user_id = f"{platform}_{group_id}_{user_id}"
-            agent_id = f"group_bot_{platform}_{group_id}"
+            # Shared memory for the entire Group/Server
+            agent_id = f"agent_{platform}_group_{group_id}"
         else:
-            # Isolated memory for Private Chat (Personal AI mode)
-            account_id = f"{platform}_private"
-            ov_user_id = f"{platform}_{user_id}"
-            agent_id = f"personal_ai_{platform}_{user_id}"
+            # Dedicated memory for the individual User
+            agent_id = f"agent_{platform}_user_{user_id}"
 
         headers = {
             "X-OpenViking-Account": account_id,
@@ -124,6 +127,8 @@ class OpenVikingMemoryPlugin(Star):
     @filter.on_llm_request()
     async def before_llm_request(self, event: AstrMessageEvent, request: ProviderRequest):
         """Inject relevant memories into the prompt (Shallow Intuition)."""
+        if event.get_platform_name() == "dashboard":
+            return
         try:
             ov_session_id = await self._get_ov_session(event)
             headers = self._get_headers(event)
@@ -162,6 +167,8 @@ class OpenVikingMemoryPlugin(Star):
     @filter.on_llm_response()
     async def after_llm_response(self, event: AstrMessageEvent, response: LLMResponse):
         """Sync the conversation turn to OpenViking."""
+        if event.get_platform_name() == "dashboard":
+            return
         try:
             ov_session_id = await self._get_ov_session(event)
             headers = self._get_headers(event)
@@ -217,25 +224,49 @@ class OpenVikingMemoryPlugin(Star):
             query(string): 檢索詞或問題。
         """
         try:
+            ov_session_id = await self._get_ov_session(event)
             headers = self._get_headers(event)
             async with aiohttp.ClientSession() as session:
-                # Search across memories (user and agent scope)
-                async with session.get(
-                    f"{self._get_ov_base_url()}/api/v1/search?query={query}",
-                    headers=headers
+                # Search across memories using POST /api/v1/search/search
+                async with session.post(
+                    f"{self._get_ov_base_url()}/api/v1/search/search",
+                    headers=headers,
+                    json={
+                        "query": query,
+                        "session_id": ov_session_id,
+                        "limit": 10
+                    }
                 ) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        results = data.get("result", {}).get("items", [])
-                        if not results:
+                        result_dict = data.get("result", {})
+                        
+                        # Collect all items from memories, resources, and skills
+                        all_items = []
+                        if isinstance(result_dict, dict):
+                            all_items.extend(result_dict.get("memories", []))
+                            all_items.extend(result_dict.get("resources", []))
+                            all_items.extend(result_dict.get("skills", []))
+                        elif isinstance(result_dict, list):
+                            # Fallback if the API returns a flat list in some versions
+                            all_items = result_dict
+                            
+                        if not all_items:
                             return "未找到相關記憶。"
                         
                         ret = "[檢索到的記憶片段]:\n"
-                        for item in results:
-                            ret += f"- [{item.get('uri', 'unknown')}]: {item.get('abstract', '')}\n"
+                        for item in all_items:
+                            if not isinstance(item, dict):
+                                continue
+                            uri = item.get('uri', 'unknown')
+                            abstract = item.get('abstract') or item.get('content', '')
+                            # Truncate abstract if too long
+                            if len(abstract) > 300:
+                                abstract = abstract[:300] + "..."
+                            ret += f"- [{uri}]: {abstract}\n"
                         return ret
                     else:
-                        return f"記憶檢索失敗: {resp.status}"
+                        return f"記憶檢索失敗: {resp.status} - {await resp.text()}"
         except Exception as e:
             return f"記憶檢索發生錯誤: {str(e)}"
 
@@ -293,6 +324,28 @@ class OpenVikingMemoryPlugin(Star):
                         return f"無法展開歸檔: {resp.status}"
         except Exception as e:
             return f"展開歸檔發生錯誤: {str(e)}"
+
+    @filter.llm_tool(name="memory_forget")
+    async def memory_forget(self, event: AstrMessageEvent, uri: str):
+        """刪除特定的長期記憶。Agent 應先通過 memory_recall 獲取目標記憶的 URI。
+
+        Args:
+            uri(string): 記憶的唯一標識符 (URI)。
+        """
+        try:
+            headers = self._get_headers(event)
+            async with aiohttp.ClientSession() as session:
+                # OpenViking deletes via DELETE /api/v1/fs?uri=...
+                async with session.delete(
+                    f"{self._get_ov_base_url()}/api/v1/fs?uri={uri}",
+                    headers=headers
+                ) as resp:
+                    if resp.status == 200:
+                        return f"記憶 {uri} 已成功刪除，我將不再記得這件事。"
+                    else:
+                        return f"刪除記憶失敗: {resp.status} - {await resp.text()}"
+        except Exception as e:
+            return f"刪除記憶時發生錯誤: {str(e)}"
 
     async def terminate(self):
         """Plugin shutdown."""

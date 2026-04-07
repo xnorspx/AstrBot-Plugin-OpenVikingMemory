@@ -1,0 +1,32 @@
+{
+  "server": {
+    "auth_mode": "trusted",
+    "host": "127.0.0.1",
+    "port": 1933
+  },
+  "memory": {
+    "agent_scope_mode": "agent"
+  },
+  "storage": {
+    "workspace": "~/.openviking/workspace"
+  },
+  "log": {
+    "level": "INFO",
+    "output": "stdout"
+  },
+  "embedding": {
+    "dense": {
+      "api_base": "https://api.your-provider.com/v1",
+      "api_key": "YOUR_API_KEY",
+      "provider": "openai",
+      "dimension": 4096,
+      "model": "your-embedding-model"
+    }
+  },
+  "vlm": {
+    "api_base": "https://api.your-provider.com/v1",
+    "api_key": "YOUR_API_KEY",
+    "provider": "openai",
+    "model": "your-vlm-model"
+  }
+}
