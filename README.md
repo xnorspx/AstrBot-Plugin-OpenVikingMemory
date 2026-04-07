@@ -30,7 +30,7 @@
 
 ### 4. 平台與測試環境過濾
 - **平台無關性**：路由 Header (X-OpenViking-Account) 使用 `{platform}_{id}` 格式，確保了在多平台同時掛載時，記憶空間不會混淆。
-- **測試環境保護**：插件會自動識別並過濾來自 `dashboard` (WebUI 測試對話) 的消息存儲，防止測試數據污染長期記憶庫。
+- **測試環境支持**：自動識別 `dashboard` (WebUI 測試對話) 並將其記憶隔離在 `dashboard_private` 空間下。這允許開發者在 WebUI 中安全地測試記憶功能，而不會干擾正式環境的數據。
 
 ### 5. Token 計算策略
 - **估算法**：插件使用「字元數 (Character Count)」來估算對話長度。預設累積 2000 字元觸發一次 Commit。
@@ -43,7 +43,8 @@
    - **OpenViking Base URL**：你的 OpenViking 服務器地址。
    - **API Key**：可選的身份驗證密鑰。
    - **歸檔閾值**：觸發自動 Commit 的字元數上限。
-3. 在 OpenViking 的配置中建議設置 `memory.agent_scope_mode: "agent"`。
+3. **重要：在 AstrBot 的 Persona (人格/角色) 設置中，確保為目標 Agent 啟用了本插件。**（AstrBot 默認可能禁用新插件，若不手動啟用，Agent 將無法看見並調用記憶工具）。
+4. 在 OpenViking 的配置中建議設置 `memory.agent_scope_mode: "agent"`。
 
 ## 提供的工具 (LLM Tools)
 

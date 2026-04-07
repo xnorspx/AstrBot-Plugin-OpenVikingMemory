@@ -162,8 +162,6 @@ class OpenVikingMemoryPlugin(Star):
     @filter.on_llm_response()
     async def after_llm_response(self, event: AstrMessageEvent, response: LLMResponse):
         """Sync the conversation turn to OpenViking."""
-        if event.get_platform_name() == "dashboard":
-            return
         try:
             ov_session_id = await self._get_ov_session(event)
             headers = self._get_headers(event)
