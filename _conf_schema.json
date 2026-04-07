@@ -1,0 +1,20 @@
+{
+    "ov_base_url": {
+        "name": "OpenViking Base URL",
+        "description": "OpenViking HTTP 服務器的基礎 URL。",
+        "type": "string",
+        "default": "http://127.0.0.1:1933"
+    },
+    "api_key": {
+        "name": "API Key",
+        "description": "OpenViking 的 API Key（如果啟用了身份驗證）。",
+        "type": "string",
+        "default": ""
+    },
+    "commit_threshold": {
+        "name": "歸檔閾值 (Token)",
+        "description": "累積多少 Token 後觸發一次 OpenViking 歸檔（Commit）。",
+        "type": "int",
+        "default": 2000
+    }
+}
