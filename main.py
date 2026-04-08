@@ -24,7 +24,7 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 
 
-@register("openviking_memory", "Sunny", "OpenViking Long-term Memory Plugin", "1.0.4")
+@register("openviking_memory", "Sunny", "OpenViking Long-term Memory Plugin", "1.0.6")
 class OpenVikingMemoryPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -34,7 +34,7 @@ class OpenVikingMemoryPlugin(Star):
 
     async def initialize(self):
         """Initialize plugin."""
-        logger.info(f"OpenViking Memory Plugin v1.0.4 initialized. Target: {self._get_ov_base_url()}")
+        logger.info(f"OpenViking Memory Plugin v1.0.6 initialized. Target: {self._get_ov_base_url()}")
 
     def _get_ov_base_url(self) -> str:
         url = self.config.get("ov_base_url", "http://127.0.0.1:1933")
@@ -46,18 +46,36 @@ class OpenVikingMemoryPlugin(Star):
     def _get_commit_threshold(self) -> int:
         return self.config.get("commit_threshold", 2000)
 
-    async def _get_persona_id(self, event: AstrMessageEvent) -> str:
-        """Retrieve current Persona ID from session context."""
+    async def _resolve_persona_id(self, event: AstrMessageEvent, conversation_persona_id: Optional[str] = None) -> str:
+        """Resolve the active Persona ID using AstrBot's resolution logic."""
         try:
-            conv_mgr = self.context.conversation_mgr
-            cid = await conv_mgr.get_curr_conversation_id(event.unified_msg_origin)
-            if cid:
-                conv = await conv_mgr.get_conversation(event.unified_msg_origin, cid)
-                if conv and conv.persona_id:
-                    return conv.persona_id
+            # If conversation_persona_id is not provided, try to get it from DB
+            if not conversation_persona_id:
+                conv_mgr = self.context.conversation_manager
+                cid = await conv_mgr.get_curr_conversation_id(event.unified_msg_origin)
+                if cid:
+                    conv = await conv_mgr.get_conversation(event.unified_msg_origin, cid)
+                    if conv:
+                        conversation_persona_id = conv.persona_id
+
+            # Use AstrBot's PersonaManager to resolve the final persona
+            # This handles session rules, conversation settings, and global defaults
+            persona_mgr = self.context.persona_manager
+            provider_settings = self.context.astrbot_config_mgr.get_conf(event.unified_msg_origin).get("provider_settings", {})
+            
+            persona_id, _, _, _ = await persona_mgr.resolve_selected_persona(
+                umo=event.unified_msg_origin,
+                conversation_persona_id=conversation_persona_id,
+                platform_name=event.get_platform_name(),
+                provider_settings=provider_settings
+            )
+            
+            if persona_id:
+                return str(persona_id)
         except Exception as e:
-            logger.error(f"Error getting persona_id: {e}")
-        return "default_persona"
+            logger.error(f"Error resolving persona_id: {e}")
+            
+        return "default"
 
     def _get_headers(self, event: AstrMessageEvent, persona_id: str) -> Dict[str, str]:
         """Construct routing headers with persona-aware Agent IDs for strict isolation."""
@@ -73,10 +91,8 @@ class OpenVikingMemoryPlugin(Star):
         
         # Agent ID is now Bot-specific using persona_id to prevent multi-bot collision
         if group_id:
-            # agent_discord_vera_group_12345
             agent_id = f"agent_{platform}_{persona_id}_group_{group_id}"
         else:
-            # agent_discord_vera_user_sunny
             agent_id = f"agent_{platform}_{persona_id}_user_{user_id}"
 
         headers = {
@@ -92,7 +108,6 @@ class OpenVikingMemoryPlugin(Star):
 
     async def _get_ov_session(self, event: AstrMessageEvent, persona_id: str) -> str:
         umo = event.unified_msg_origin
-        # Include persona_id in mapping key to handle multiple bots in same UMO
         mapping_key = f"{umo}:{persona_id}"
         if mapping_key not in self.session_map:
             headers = self._get_headers(event, persona_id)
@@ -126,8 +141,10 @@ class OpenVikingMemoryPlugin(Star):
         if event.get_platform_name() == "dashboard":
             return
         try:
-            # persona_id is directly available in request object
-            persona_id = request.conversation.persona_id if request.conversation else "default_persona"
+            # Resolve the active persona ID
+            conv_persona_id = request.conversation.persona_id if request.conversation else None
+            persona_id = await self._resolve_persona_id(event, conv_persona_id)
+            
             ov_session_id = await self._get_ov_session(event, persona_id)
             headers = self._get_headers(event, persona_id)
             
@@ -167,7 +184,7 @@ class OpenVikingMemoryPlugin(Star):
         if event.get_platform_name() == "dashboard":
             return
         try:
-            persona_id = await self._get_persona_id(event)
+            persona_id = await self._resolve_persona_id(event)
             ov_session_id = await self._get_ov_session(event, persona_id)
             headers = self._get_headers(event, persona_id)
             user_text = self._degrade_message(event.get_messages())
@@ -189,7 +206,7 @@ class OpenVikingMemoryPlugin(Star):
     @filter.regex(r"^/new(\s|$)")
     async def handle_new_conversation(self, event: AstrMessageEvent):
         umo = event.unified_msg_origin
-        persona_id = await self._get_persona_id(event)
+        persona_id = await self._resolve_persona_id(event)
         mapping_key = f"{umo}:{persona_id}"
         if mapping_key in self.session_map:
             del self.session_map[mapping_key]
@@ -199,7 +216,7 @@ class OpenVikingMemoryPlugin(Star):
     async def memory_recall(self, event: AstrMessageEvent, query: str):
         """從長期記憶中檢索相關信息。"""
         try:
-            persona_id = await self._get_persona_id(event)
+            persona_id = await self._resolve_persona_id(event)
             ov_session_id = await self._get_ov_session(event, persona_id)
             headers = self._get_headers(event, persona_id)
             async with aiohttp.ClientSession() as session:
@@ -230,7 +247,7 @@ class OpenVikingMemoryPlugin(Star):
     async def memory_store(self, event: AstrMessageEvent, fact: str):
         """立即存入事實。"""
         try:
-            persona_id = await self._get_persona_id(event)
+            persona_id = await self._resolve_persona_id(event)
             ov_session_id = await self._get_ov_session(event, persona_id)
             headers = self._get_headers(event, persona_id)
             async with aiohttp.ClientSession() as session:
@@ -245,7 +262,7 @@ class OpenVikingMemoryPlugin(Star):
     async def archive_expand(self, event: AstrMessageEvent, archive_id: str):
         """展開歸檔內容。"""
         try:
-            persona_id = await self._get_persona_id(event)
+            persona_id = await self._resolve_persona_id(event)
             ov_session_id = await self._get_ov_session(event, persona_id)
             headers = self._get_headers(event, persona_id)
             async with aiohttp.ClientSession() as session:
@@ -265,7 +282,7 @@ class OpenVikingMemoryPlugin(Star):
     async def memory_forget(self, event: AstrMessageEvent, uri: str):
         """遺忘記憶。"""
         try:
-            persona_id = await self._get_persona_id(event)
+            persona_id = await self._resolve_persona_id(event)
             headers = self._get_headers(event, persona_id)
             async with aiohttp.ClientSession() as session:
                 async with session.delete(f"{self._get_ov_base_url()}/api/v1/fs?uri={uri}", headers=headers) as resp:
