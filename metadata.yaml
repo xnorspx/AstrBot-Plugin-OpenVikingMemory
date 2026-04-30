@@ -1,7 +1,7 @@
 name: astrbot_plugin_openviking_memory
 display_name: OpenViking 記憶層插件
 desc: 為 AstrBot 提供基於 OpenViking 的長期記憶、群聊共享記憶與多模態降級存儲。
-version: v1.0.1
+version: v1.1.5
 author: Sunny
 repo: https://github.com/volcengine/OpenViking
 astrbot_version: ">=4.23.0"

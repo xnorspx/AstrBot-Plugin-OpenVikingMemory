@@ -1,8 +1,10 @@
 import aiohttp
 import asyncio
 import hashlib
+import os
 import time
 import uuid
+import yaml
 from typing import Dict, List, Optional
 
 from astrbot.api.event import AstrMessageEvent, filter
@@ -23,19 +25,35 @@ from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 
+# Load metadata from metadata.yaml as a single source of truth
+metadata_path = os.path.join(os.path.dirname(__file__), "metadata.yaml")
+with open(metadata_path, encoding="utf-8") as f:
+    metadata = yaml.safe_load(f)
 
-@register("openviking_memory", "Sunny", "OpenViking Long-term Memory Plugin", "1.0.6")
+# Strip 'v' prefix from version if present
+plugin_version = metadata.get("version", "1.0.0").lstrip("v")
+plugin_name = metadata.get("name", "openviking_memory")
+plugin_author = metadata.get("author", "Sunny")
+plugin_desc = metadata.get("desc", "OpenViking Long-term Memory Plugin")
+
+
+@register(plugin_name, plugin_author, plugin_desc, plugin_version)
 class OpenVikingMemoryPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
         self.config = config if config else {}
         self.session_map: Dict[str, str] = {}
         self.pending_tokens: Dict[str, int] = {}
+        self.session: Optional[aiohttp.ClientSession] = None
 
     async def initialize(self):
         """Initialize plugin."""
+        self.session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=15),
+            headers={"Content-Type": "application/json"}
+        )
         logger.info(
-            f"OpenViking Memory Plugin v1.0.6 initialized. Target: {self._get_ov_base_url()}"
+            f"OpenViking Memory Plugin v{plugin_version} initialized. Target: {self._get_ov_base_url()}"
         )
 
     def _get_ov_base_url(self) -> str:
@@ -119,8 +137,8 @@ class OpenVikingMemoryPlugin(Star):
         mapping_key = f"{umo}:{persona_id}"
         if mapping_key not in self.session_map:
             headers = self._get_headers(event, persona_id)
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
+            try:
+                async with self.session.post(
                     f"{self._get_ov_base_url()}/api/v1/sessions",
                     headers=headers,
                     json={},
@@ -132,9 +150,12 @@ class OpenVikingMemoryPlugin(Star):
                         logger.error(
                             f"Failed to create OV session: {await resp.text()}"
                         )
-                        self.session_map[mapping_key] = hashlib.md5(
-                            mapping_key.encode()
-                        ).hexdigest()
+                        # Do not cache invalid MD5 hash to prevent cache poisoning.
+                        # Return a temporary one but don't save it to self.session_map.
+                        return hashlib.md5(mapping_key.encode()).hexdigest()
+            except Exception as e:
+                logger.error(f"Error creating OV session: {e}")
+                return hashlib.md5(mapping_key.encode()).hexdigest()
         return self.session_map[mapping_key]
 
     def _degrade_message(self, chain: List[BaseMessageComponent]) -> str:
@@ -169,6 +190,10 @@ class OpenVikingMemoryPlugin(Star):
         if event.get_platform_name() == "dashboard":
             return
         try:
+            # Store ambient context for synchronization in after_llm_response (Scenario A)
+            if request.contexts:
+                event.set_extra("ov_ambient_context", request.contexts)
+
             # Resolve the active persona ID
             conv_persona_id = (
                 request.conversation.persona_id if request.conversation else None
@@ -178,34 +203,44 @@ class OpenVikingMemoryPlugin(Star):
             ov_session_id = await self._get_ov_session(event, persona_id)
             headers = self._get_headers(event, persona_id)
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{self._get_ov_base_url()}/api/v1/sessions/{ov_session_id}/context?token_budget=800",
-                    headers=headers,
-                ) as resp:
-                    if resp.status == 200:
-                        ctx_data = await resp.json()
-                        ov_ctx = ctx_data.get("result", {})
+            async with self.session.get(
+                f"{self._get_ov_base_url()}/api/v1/sessions/{ov_session_id}/context?token_budget=800",
+                headers=headers,
+            ) as resp:
+                if resp.status == 200:
+                    ctx_data = await resp.json()
+                    ov_ctx = ctx_data.get("result", {})
+                    
+                    # Optimize: Silent Injection. Only inject when there is actual content.
+                    content_parts = []
+                    
+                    # 1. Latest Archive Overview (Summary of the most recent finished segment)
+                    latest_ov = ov_ctx.get("latest_archive_overview")
+                    if latest_ov:
+                        content_parts.append(f"[最近會話總結]:\n{latest_ov}")
+                    
+                    # 2. Historical Archive Abstracts (Chronological context tracking)
+                    pre_abstracts = ov_ctx.get("pre_archive_abstracts", [])
+                    if pre_abstracts:
+                        abstract_lines = ["[歷史會話脈絡]:"]
+                        for arch in pre_abstracts:
+                            arch_id = arch.get("archive_id", "unknown")
+                            abstract_lines.append(f"- [ID: {arch_id}] {arch.get('abstract', '')}")
+                        content_parts.append("\n".join(abstract_lines))
+                    
+                    if content_parts:
                         memory_block = "\n<relevant-memories>\n"
-
-                        mems = ov_ctx.get("memories", [])
-                        if mems:
-                            memory_block += "[長期記憶與經驗教訓]:\n"
-                            for m in mems:
-                                memory_block += f"- {m.get('abstract', '')}\n"
-                            memory_block += "\n"
-
-                        if "archives" in ov_ctx and ov_ctx["archives"]:
-                            memory_block += "[近期會話歸檔摘要]:\n"
-                            for arch in ov_ctx["archives"]:
-                                memory_block += f"- {arch.get('overview', '')}\n"
-
-                        memory_block += "\n(如果你需要獲取更詳細的信息或回想更多細節，可以調用 memory_recall 工具。)\n"
+                        memory_block += "\n\n".join(content_parts)
+                        memory_block += "\n\n(如果你需要獲取更詳細的信息或回想更多細節，可以調用 memory_recall 工具。)\n"
                         memory_block += "</relevant-memories>\n"
-                        if request.system_prompt:
+                        
+                        # Fix: Safe injection to prevent TypeError if prompt/system_prompt is None
+                        if request.system_prompt is not None:
                             request.system_prompt = memory_block + request.system_prompt
-                        else:
+                        elif request.prompt is not None:
                             request.prompt = memory_block + request.prompt
+                        else:
+                            request.system_prompt = memory_block
         except Exception as e:
             logger.error(f"Error in OpenViking Shallow Intuition: {e}")
 
@@ -224,31 +259,68 @@ class OpenVikingMemoryPlugin(Star):
                 else "[Tool Call/Empty Response]"
             )
 
-            async with aiohttp.ClientSession() as session:
-                base_url = self._get_ov_base_url()
-                await session.post(
-                    f"{base_url}/api/v1/sessions/{ov_session_id}/messages",
-                    headers=headers,
-                    json={"role": "user", "content": user_text},
-                )
-                await session.post(
-                    f"{base_url}/api/v1/sessions/{ov_session_id}/messages",
-                    headers=headers,
-                    json={"role": "assistant", "content": assistant_text},
-                )
+            base_url = self._get_ov_base_url()
 
-                mapping_key = f"{event.unified_msg_origin}:{persona_id}"
-                self.pending_tokens[mapping_key] = (
-                    self.pending_tokens.get(mapping_key, 0)
-                    + len(user_text)
-                    + len(assistant_text)
+            # Scenario A: Sync Ambient Context
+            ambient_context = event.get_extra("ov_ambient_context")
+            if ambient_context and isinstance(ambient_context, list):
+                # Find messages after the last assistant response to avoid duplication
+                new_ambient = []
+                for msg in reversed(ambient_context):
+                    if msg.get("role") == "assistant":
+                        break
+                    new_ambient.insert(0, msg)
+                
+                if new_ambient:
+                    ambient_lines = []
+                    for msg in new_ambient:
+                        role = msg.get("role", "user")
+                        content = msg.get("content", "")
+                        # Handle multimodal content
+                        if isinstance(content, list):
+                            text_parts = []
+                            for p in content:
+                                if p.get("type") == "text":
+                                    text_parts.append(p.get("text", ""))
+                                else:
+                                    text_parts.append(f"[{p.get('type', 'media')}]")
+                            content = " ".join(text_parts)
+                        
+                        if content and str(content).strip():
+                            ambient_lines.append(f"{role}: {str(content).strip()}")
+                    
+                    if ambient_lines:
+                        ambient_text = "[群聊背景上下文]:\n" + "\n".join(ambient_lines)
+                        await self.session.post(
+                            f"{base_url}/api/v1/sessions/{ov_session_id}/messages",
+                            headers=headers,
+                            json={"role": "system", "content": ambient_text},
+                        )
+
+            # Sync current interaction
+            await self.session.post(
+                f"{base_url}/api/v1/sessions/{ov_session_id}/messages",
+                headers=headers,
+                json={"role": "user", "content": user_text},
+            )
+            await self.session.post(
+                f"{base_url}/api/v1/sessions/{ov_session_id}/messages",
+                headers=headers,
+                json={"role": "assistant", "content": assistant_text},
+            )
+
+            mapping_key = f"{event.unified_msg_origin}:{persona_id}"
+            self.pending_tokens[mapping_key] = (
+                self.pending_tokens.get(mapping_key, 0)
+                + len(user_text)
+                + len(assistant_text)
+            )
+            if self.pending_tokens[mapping_key] >= self._get_commit_threshold():
+                await self.session.post(
+                    f"{base_url}/api/v1/sessions/{ov_session_id}/commit",
+                    headers=headers,
                 )
-                if self.pending_tokens[mapping_key] >= self._get_commit_threshold():
-                    await session.post(
-                        f"{base_url}/api/v1/sessions/{ov_session_id}/commit",
-                        headers=headers,
-                    )
-                    self.pending_tokens[mapping_key] = 0
+                self.pending_tokens[mapping_key] = 0
         except Exception as e:
             logger.error(f"Error syncing to OpenViking: {e}")
 
@@ -272,36 +344,55 @@ class OpenVikingMemoryPlugin(Star):
             persona_id = await self._resolve_persona_id(event)
             ov_session_id = await self._get_ov_session(event, persona_id)
             headers = self._get_headers(event, persona_id)
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{self._get_ov_base_url()}/api/v1/search/find",
-                    headers=headers,
-                    json={
-                        "query": query,
-                        "target_uri": "viking://user/",
-                        "limit": 5,
-                        "score_threshold": 0.05,
-                    },
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        result_dict = data.get("result", {})
-                        all_items = []
-                        if isinstance(result_dict, dict):
-                            all_items.extend(result_dict.get("memories", []))
-                            all_items.extend(result_dict.get("resources", []))
-                            all_items.extend(result_dict.get("skills", []))
-                        if not all_items:
-                            return "未找到相關記憶。"
-                        ret = "[檢索到的記憶片段]:\n"
-                        for item in all_items:
-                            uri, abstract = (
-                                item.get("uri", "unknown"),
-                                item.get("abstract") or item.get("content", ""),
-                            )
-                            ret += f"- [{uri}]: {abstract[:300]}\n"
-                        return ret
-                    return f"檢索失敗: {resp.status}"
+            async with self.session.post(
+                f"{self._get_ov_base_url()}/api/v1/search/find",
+                headers=headers,
+                json={
+                    "query": query,
+                    "target_uri": "viking://",
+                    "limit": 5,
+                    "score_threshold": 0.05,
+                },
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    result_dict = data.get("result", {})
+                    all_items = []
+                    if isinstance(result_dict, dict):
+                        all_items.extend(result_dict.get("memories", []))
+                        all_items.extend(result_dict.get("resources", []))
+                        all_items.extend(result_dict.get("skills", []))
+                    if not all_items:
+                        return "未找到相關記憶。"
+                    ret = "[檢索到的記憶片段]:\n"
+                    # Fetch full content for level-2 memories in parallel to ensure details (like UID) are retrieved
+                    async def fetch_full_content(item):
+                        uri = item.get("uri", "unknown")
+                        level = item.get("level", 2)
+                        if level == 2:
+                            try:
+                                async with self.session.get(
+                                    f"{self._get_ov_base_url()}/api/v1/content/read?uri={uri}",
+                                    headers=headers,
+                                ) as c_resp:
+                                    if c_resp.status == 200:
+                                        c_data = await c_resp.json()
+                                        full_content = c_data.get("result", "")
+                                        if full_content:
+                                            return f"- [{uri}]: {full_content[:1000]}"
+                            except Exception as e:
+                                logger.error(f"Error reading full content for {uri}: {e}")
+                        
+                        abstract = item.get("abstract") or item.get("content") or "無內容"
+                        return f"- [{uri}]: {abstract[:300]}"
+
+                    tasks = [fetch_full_content(item) for item in all_items]
+                    results = await asyncio.gather(*tasks)
+                    
+                    ret = "[檢索到的記憶片段]:\n"
+                    ret += "\n".join(results)
+                    return ret
+                return f"檢索失敗: {resp.status}"
         except Exception as e:
             return f"檢索錯誤: {str(e)}"
 
@@ -316,18 +407,17 @@ class OpenVikingMemoryPlugin(Star):
             persona_id = await self._resolve_persona_id(event)
             ov_session_id = await self._get_ov_session(event, persona_id)
             headers = self._get_headers(event, persona_id)
-            async with aiohttp.ClientSession() as session:
-                base_url = self._get_ov_base_url()
-                await session.post(
-                    f"{base_url}/api/v1/sessions/{ov_session_id}/messages",
-                    headers=headers,
-                    json={"role": "system", "content": f"[IMPORTANT FACT]: {fact}"},
-                )
-                await session.post(
-                    f"{base_url}/api/v1/sessions/{ov_session_id}/commit",
-                    headers=headers,
-                )
-                return "事實已存入並建立索引。"
+            base_url = self._get_ov_base_url()
+            await self.session.post(
+                f"{base_url}/api/v1/sessions/{ov_session_id}/messages",
+                headers=headers,
+                json={"role": "system", "content": f"[IMPORTANT FACT]: {fact}"},
+            )
+            await self.session.post(
+                f"{base_url}/api/v1/sessions/{ov_session_id}/commit",
+                headers=headers,
+            )
+            return "事實已存入並建立索引。"
         except Exception as e:
             return f"存儲失敗: {str(e)}"
 
@@ -342,21 +432,20 @@ class OpenVikingMemoryPlugin(Star):
             persona_id = await self._resolve_persona_id(event)
             ov_session_id = await self._get_ov_session(event, persona_id)
             headers = self._get_headers(event, persona_id)
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{self._get_ov_base_url()}/api/v1/sessions/{ov_session_id}/archives/{archive_id}",
-                    headers=headers,
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        messages = data.get("result", {}).get("messages", [])
-                        if not messages:
-                            return "歸檔為空。"
-                        ret = f"[歸檔 {archive_id} 內容]:\n"
-                        for msg in messages:
-                            ret += f"{msg.get('role', 'unknown')}: {msg.get('content', '')}\n"
-                        return ret
-                    return f"展開失敗: {resp.status}"
+            async with self.session.get(
+                f"{self._get_ov_base_url()}/api/v1/sessions/{ov_session_id}/archives/{archive_id}",
+                headers=headers,
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    messages = data.get("result", {}).get("messages", [])
+                    if not messages:
+                        return "歸檔為空。"
+                    ret = f"[歸檔 {archive_id} 內容]:\n"
+                    for msg in messages:
+                        ret += f"{msg.get('role', 'unknown')}: {msg.get('content', '')}\n"
+                    return ret
+                return f"展開失敗: {resp.status}"
         except Exception as e:
             return f"展開錯誤: {str(e)}"
 
@@ -370,15 +459,16 @@ class OpenVikingMemoryPlugin(Star):
         try:
             persona_id = await self._resolve_persona_id(event)
             headers = self._get_headers(event, persona_id)
-            async with aiohttp.ClientSession() as session:
-                async with session.delete(
-                    f"{self._get_ov_base_url()}/api/v1/fs?uri={uri}", headers=headers
-                ) as resp:
-                    if resp.status == 200:
-                        return f"記憶 {uri} 已刪除。"
-                    return f"刪除失敗: {resp.status}"
+            async with self.session.delete(
+                f"{self._get_ov_base_url()}/api/v1/fs?uri={uri}", headers=headers
+            ) as resp:
+                if resp.status == 200:
+                    return f"記憶 {uri} 已刪除。"
+                return f"刪除失敗: {resp.status}"
         except Exception as e:
             return f"刪除錯誤: {str(e)}"
 
     async def terminate(self):
+        if self.session:
+            await self.session.close()
         logger.info("OpenViking Memory Plugin shutting down.")
